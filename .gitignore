@@ -1,0 +1,20 @@
+# third-party checkout and build output (clone ggml-org/llama.cpp, see README)
+llama.cpp/
+build*/
+# model weights (download from Hugging Face)
+models/
+# customer photos and derived crops -- do NOT publish
+data/
+# local env, raw device logs
+.venv/
+logs/
+*.log
+perf.data
+__pycache__/
+.DS_Store
+llama-b10516/
+vk_build.out
+old_build.out
+llama-vk-fix/
+opencl_stub/
+llama-repack/

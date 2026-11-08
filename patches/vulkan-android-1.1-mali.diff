@@ -1,0 +1,54 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index e5c90f6a7..f582323a1 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1047,7 +1047,11 @@ std::unique_ptr<vk_queue> ggml_vk_create_queue(vk_device& device, uint32_t queue
+         h = std::make_shared<vk_queue_handle_synchronized>();
+     }
+ 
+-    h->queue = device->device.getQueue2(queue_info2);
++    if (device->has_internally_synchronized_queues) {
++        h->queue = device->device.getQueue2(queue_info2);
++    } else {
++        h->queue = device->device.getQueue(queue_family_index, queue_index);
++    }
+     h->device = device;
+     // Avoid concurrent submissions on NVIDIA due to driver bug.
+     if (device->vendor_id == VK_VENDOR_ID_NVIDIA) {
+@@ -4589,7 +4593,8 @@ vk_device ggml_vk_get_device(size_t idx) {
+                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
+ 
+         device->shader_int64 = device_features2.features.shaderInt64;
+-        device->buffer_device_address = vk12_features.bufferDeviceAddress;
++        // core vkGetBufferDeviceAddress only exists on Vulkan >= 1.2 devices (the KHR extension is not enabled here)
++        device->buffer_device_address = vk12_features.bufferDeviceAddress && device->properties.apiVersion >= VK_API_VERSION_1_2;
+         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
+ 
+         if (device->subgroup_size_control) {
+@@ -4719,6 +4724,10 @@ vk_device ggml_vk_get_device(size_t idx) {
+         }
+ 
+         device_extensions.push_back("VK_KHR_16bit_storage");
++        if (device->properties.apiVersion < VK_API_VERSION_1_2) {
++            // Vulkan 1.1 device: features used from the 1.2 core are only available as extensions
++            device_extensions.push_back("VK_KHR_timeline_semaphore");
++        }
+ 
+ #ifdef GGML_VULKAN_VALIDATE
+         device_extensions.push_back("VK_KHR_shader_non_semantic_info");
+@@ -4842,6 +4851,15 @@ vk_device ggml_vk_get_device(size_t idx) {
+         device_create_info.setPNext(&device_features2);
+         device->device = device->physical_device.createDevice(device_create_info);
+ 
++        if (device->properties.apiVersion < VK_API_VERSION_1_2) {
++            // Vulkan 1.1 driver: the dispatcher was initialised from the instance, so core 1.2 names resolve to loader
++            // trampolines whose driver entry is NULL. Route the timeline-semaphore calls to the KHR entry points.
++            auto & d = VULKAN_HPP_DEFAULT_DISPATCHER;
++            d.vkWaitSemaphores           = d.vkWaitSemaphoresKHR;
++            d.vkSignalSemaphore          = d.vkSignalSemaphoreKHR;
++            d.vkGetSemaphoreCounterValue = d.vkGetSemaphoreCounterValueKHR;
++        }
++
+         if (device->device_fault) {
+             device->pfn_vkGetDeviceFaultInfoEXT = (PFN_vkGetDeviceFaultInfoEXT)
+                 vkGetDeviceProcAddr(device->device, "vkGetDeviceFaultInfoEXT");
