@@ -18,3 +18,5 @@ old_build.out
 llama-vk-fix/
 opencl_stub/
 llama-repack/
+CLAUDE.md
+llama-repack-clean/

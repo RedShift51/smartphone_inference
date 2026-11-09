@@ -3,7 +3,7 @@
 Setup: Redmi 13 (Helio G99 / MT6789, 2x A76 2.2 GHz + 6x A55 2.0 GHz, Mali-G57 MC2, 12 GB), Android 13. LFM2-VL-450M Q8_0 (LM and mmproj), llama.cpp `a691b2345844ce1b430201fc5fd404ce062e05f2` (2026-11-08), `llama-mtmd-cli`, CPU unless stated. Task: read a 4-digit price from a price tag. Battery and CPU temperature were recorded before every run. Nothing here was committed, pushed or published. Details and raw data: `summary.md`, `final_report.md`, `docs/`, CSV files in `results/`.
 
 ## 1. Where the time goes
-- **VERDICT: the vision encoder is 75-80% of TTFT; the LM and the prompt text are small.** Tight crop median: encoder 1.4 s, image tokens in the LM 0.4 s, prompt text 0.2 s, TTFT 2.0 s.
+- **VERDICT: the vision encoder is 70-78% of TTFT; the LM and the prompt text are small.** Tight crop median: encoder 1.4 s, image tokens in the LM 0.4 s, prompt text 0.2 s, TTFT 2.0 s.
 - Cost per image token: encoder about 20 ms (R^2 = 0.99); LM prefill about 5.5 ms.
 
 ## 2. Crop vs full frame

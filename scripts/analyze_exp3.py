@@ -37,7 +37,7 @@ for k,l,col in PH:
     m=np.array([st.median(x[k] for x in g[c]) for c in cs])/1000; ax.bar(range(len(cs)),m,bottom=bot,label=l,color=col,width=.65); bot+=m
 for i,c in enumerate(cs): ax.text(i,bot[i]+.12,f"{bot[i]:.1f}s",ha="center",fontweight="bold")
 ax.set_xticks(range(len(cs))); ax.set_xticklabels(["full shelf\n(1 tile)","shelf ↓\nto ~70 tok","tag +\ncontext","tight tag\ncrop","tight crop,\n20 tok"],fontsize=12)
-ax.set_ylabel("time to first token, s (median)"); ax.set_title("Where the time goes\nLFM2-VL-450M, Helio G99, CPU",fontsize=17); ax.legend(frameon=False,loc="upper right"); fig.tight_layout(); fig.savefig("results/post/time_by_phase.png",dpi=160)
+ax.set_ylabel("time, s (median)"); ax.set_title("Where the time goes\nLFM2-VL-450M, Helio G99, CPU",fontsize=17); ax.legend(frameon=False,loc="upper right"); fig.tight_layout(); fig.savefig("results/post/time_by_phase.png",dpi=160)
 # A alone
 fig,ax=plt.subplots(figsize=(7,3.6)); v=g["A"]; a=[x["ttft_ms"]/1000 for x in v]
 ax.boxplot(a,orientation="horizontal",widths=.5); ax.set_yticks([1]); ax.set_yticklabels(["full shelf\n(tiled)"]); ax.set_xlabel("time to first token, s"); ax.set_title(f"Tiled full frame: median {st.median(a):.1f}s, max {max(a):.0f}s",fontsize=15); fig.tight_layout(); fig.savefig("results/post/full_shelf_tiled_ttft.png",dpi=160)

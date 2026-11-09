@@ -3,7 +3,7 @@
 Setup: Redmi 13 (Helio G99, 2x A76 + 6x A55, Mali-G57 MC2), LFM2-VL-450M Q8_0 (LM and mmproj), llama.cpp `llama-mtmd-cli`, CPU, task = read a 4-digit price from a price tag. N = 16 tags (one fully measured run per tag and condition, round-robin, battery and CPU temperature recorded before each run, `-t 4`).
 
 ## Headline numbers
-1. **The vision encoder is 75-80% of time-to-first-token.** Median TTFT for a tight tag crop is 2.0 s: encoder 1.4 s, image tokens in the LM 0.4 s, prompt text 0.2 s. Encoder cost is about **20 ms per image token** (R^2 = 0.99); the LM prefill is about 5.5 ms per token.
+1. **The vision encoder is 70-78% of time-to-first-token.** Median TTFT for a tight tag crop is 2.0 s: encoder 1.4 s, image tokens in the LM 0.4 s, prompt text 0.2 s. Encoder cost is about **20 ms per image token** (R^2 = 0.99); the LM prefill is about 5.5 ms per token.
 2. **A crop reads the price better than a squeezed full frame at the same cost.** Same token budget (72 vs 74 tokens) and the same latency (about 2.0 s), but the exact price was read in **10/16** cases with a tight tag crop vs **4/16** with the whole shelf downscaled (paired sign test: 7 vs 1, p = 0.07; suggestive at this N). A crop with context: 8/16.
 3. **Full frames get expensive fast.** A full shelf frame that fits one tile (about 250 tokens) takes 6.6 s. The default tiling splits larger frames into several 512x512 tiles plus an overview: median 6.5 s, tail up to 49 s (1776 tokens). `--image-max-tokens` does not limit tiling.
 4. **Going lower costs accuracy.** A tight crop at 20 tokens is 0.8 s TTFT but exact reads drop to 5/16 (9/16 if only the digit sequence must match; that metric is more lenient and allows false matches).

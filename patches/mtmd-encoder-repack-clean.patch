@@ -1,0 +1,244 @@
+From c79701c85e996497998773de82ab4a1242e244d0 Mon Sep 17 00:00:00 2001
+From: redshift51 <winterge77@gmail.com>
+Date: Mon, 9 Nov 2026 07:59:10 +0000
+Subject: [PATCH] mtmd: place CPU encoder weights in extra buffer types
+ (repack)
+
+The language model loads its quantized weights through the CPU extra buffer
+types (runtime repacking, e.g. q8_0_4x4), but the vision encoder allocated
+all weights in the default CPU buffer, so its matmuls ran the generic kernel.
+
+Add mtmd_context_params::use_extra_bufts (default false for API users;
+llama-mtmd-cli and llama-server set it from --repack/--no-repack, like the
+LM). On the CPU backend the loader now probes every 2D non-embedding weight
+with the same supports_op check used by llama_model_loader, puts the ones an
+extra buffer type can run into one buffer per buffer type, and loads them
+through ggml_backend_tensor_set so they get repacked. Everything else stays
+in the default buffer.
+
+Measured (LFM2-VL-450M Q8_0, Redmi 13 / Helio G99, 10 interleaved repeats,
+earlier experimental version of this change): encoder 1.6-1.8x faster,
+time to first token 1.4-1.45x, identical answers. Host (Apple M-series,
+i8mm): encoder 1.49x, answers identical on 30/30 images.
+
+Only LFM2-VL was tested. Other vision/audio projector architectures are
+untested; embedding tables are skipped by name.
+
+AI disclosure: written with Claude (Claude Code).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ tools/mtmd/clip.cpp             | 93 ++++++++++++++++++++++++++++++++-
+ tools/mtmd/clip.h               |  1 +
+ tools/mtmd/mtmd-cli.cpp         |  1 +
+ tools/mtmd/mtmd.cpp             |  2 +
+ tools/mtmd/mtmd.h               |  4 ++
+ tools/server/server-context.cpp |  1 +
+ 6 files changed, 101 insertions(+), 1 deletion(-)
+
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 0a3b3c98d..3c29cbc06 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -179,6 +179,44 @@ static std::shared_ptr<ggml_threadpool> clip_threadpool_init(int n_threads) {
+     return std::shared_ptr<ggml_threadpool>(threadpool, free_fn);
+ }
+ 
++// Same probe as llama_model_loader (weight_buft_supported): can the CPU device run a MUL_MAT with weight `w` stored in `buft`?
++static bool clip_weight_buft_supports_mul_mat(ggml_tensor * w, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
++    ggml_init_params params = {
++        /*.mem_size   =*/ ggml_tensor_overhead()*8,
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx_ptr { ggml_init(params) };
++    if (!ctx_ptr) {
++        return false;
++    }
++    ggml_context * ctx = ctx_ptr.get();
++    ggml_tensor * b  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
++    ggml_tensor * op = ggml_mul_mat(ctx, w, b);
++
++    // temporary dummy buffer so that supports_op can check the buffer type
++    GGML_ASSERT(w->buffer == nullptr);
++    w->buffer = ggml_backend_buft_alloc_buffer(buft, 0);
++    const bool supported = ggml_backend_dev_supports_op(dev, op);
++    ggml_backend_buffer_free(w->buffer);
++    w->buffer = nullptr;
++    return supported;
++}
++
++// extra CPU buffer types (weight repacking, ...), in priority order; same source as the language model loader
++static std::vector<ggml_backend_buffer_type_t> clip_get_cpu_extra_bufts(ggml_backend_dev_t cpu_dev) {
++    std::vector<ggml_backend_buffer_type_t> bufts;
++    auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
++    auto get_extra = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
++    if (get_extra) {
++        ggml_backend_buffer_type_t * extra = get_extra(cpu_dev);
++        while (extra && *extra) {
++            bufts.push_back(*extra++);
++        }
++    }
++    return bufts;
++}
++
+ struct clip_ctx {
+     clip_model model;
+ 
+@@ -195,6 +233,8 @@ struct clip_ctx {
+     ggml_backend_t backend = nullptr;
+     ggml_backend_t backend_cpu = nullptr;
+     ggml_backend_buffer_ptr buf;
++    std::vector<ggml_backend_buffer_ptr> bufs_extra; // weights placed in extra CPU buffer types (repacked)
++    bool use_extra_bufts = false;
+ 
+ 
+     int max_nodes = 8192;
+@@ -214,6 +254,7 @@ struct clip_ctx {
+     clip_ctx(clip_context_params & ctx_params, std::shared_ptr<ggml_threadpool> threadpool) : threadpool(std::move(threadpool)) {
+         flash_attn_type = ctx_params.flash_attn_type;
+         no_alloc = ctx_params.no_alloc;
++        use_extra_bufts = ctx_params.use_extra_bufts;
+         backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+         if (!backend_cpu) {
+             throw std::runtime_error("failed to initialize CPU backend");
+@@ -4813,6 +4854,56 @@ struct clip_model_loader {
+ 
+             // alloc memory and offload data
+             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
++
++            // CPU backend: place the weights that an extra buffer type can run (repacked quantized matrices) there,
++            // like the language model does; everything else stays in the default buffer type below
++            if (ctx_clip.use_extra_bufts && !ctx_clip.no_alloc && ctx_clip.backend == ctx_clip.backend_cpu) {
++                ggml_backend_dev_t cpu_dev = ggml_backend_get_device(ctx_clip.backend_cpu);
++                const auto extra_bufts = clip_get_cpu_extra_bufts(cpu_dev);
++                std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> extra_tensors;
++                LOG_DBG("%s: %zu extra buffer types available for the CPU encoder weights\n", __func__, extra_bufts.size());
++                size_t n_candidates = 0;
++                for (ggml_tensor * t = ggml_get_first_tensor(ctx_clip.ctx_data.get()); t; t = ggml_get_next_tensor(ctx_clip.ctx_data.get(), t)) {
++                    // only 2D weight matrices that are used by mul_mat; embedding tables are read by other ops
++                    if (ggml_n_dims(t) != 2 || strstr(t->name, "embd") != nullptr) {
++                        continue;
++                    }
++                    n_candidates++;
++                    for (auto * extra_buft : extra_bufts) {
++                        if (clip_weight_buft_supports_mul_mat(t, extra_buft, cpu_dev)) {
++                            extra_tensors[extra_buft].push_back(t);
++                            break;
++                        }
++                    }
++                }
++                LOG_DBG("%s: %zu candidate 2D weights, %zu buffer types selected\n", __func__, n_candidates, extra_tensors.size());
++                for (auto & [extra_buft, tensors] : extra_tensors) {
++                    const size_t align = ggml_backend_buft_get_alignment(extra_buft);
++                    size_t total = 0;
++                    for (auto * t : tensors) {
++                        total += GGML_PAD(ggml_backend_buft_get_alloc_size(extra_buft, t), align);
++                    }
++                    ggml_backend_buffer_ptr extra_buf { ggml_backend_buft_alloc_buffer(extra_buft, total) };
++                    if (!extra_buf) {
++                        throw std::runtime_error(string_format("%s: failed to allocate %zu bytes for buffer type %s\n",
++                                                               __func__, total, ggml_backend_buft_name(extra_buft)));
++                    }
++                    ggml_backend_buffer_set_usage(extra_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                    char * base = (char *) ggml_backend_buffer_get_base(extra_buf.get());
++                    size_t offset = 0;
++                    for (auto * t : tensors) {
++                        if (ggml_backend_tensor_alloc(extra_buf.get(), t, base + offset) != GGML_STATUS_SUCCESS) {
++                            throw std::runtime_error(string_format("%s: failed to place tensor %s in buffer type %s\n",
++                                                                   __func__, t->name, ggml_backend_buft_name(extra_buft)));
++                        }
++                        offset += GGML_PAD(ggml_backend_buft_get_alloc_size(extra_buft, t), align);
++                    }
++                    LOG_INF("%s: %zu tensors (%.2f MiB) placed in %s\n", __func__, tensors.size(), total / 1024.0 / 1024.0, ggml_backend_buft_name(extra_buft));
++                    ctx_clip.bufs_extra.push_back(std::move(extra_buf));
++                }
++            }
++
++            // allocates all tensors that have no buffer yet
+             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+             // read the weight from file
+@@ -4829,7 +4920,7 @@ struct clip_model_loader {
+                         throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
+                     }
+                     size_t num_bytes = ggml_nbytes(cur);
+-                    if (ggml_backend_buft_is_host(buft)) {
++                    if (ggml_backend_buft_is_host(cur->buffer ? ggml_backend_buffer_get_type(cur->buffer) : buft)) {
+                         // for the CPU and Metal backend, we can read directly into the tensor
+                         fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                     } else {
+diff --git a/tools/mtmd/clip.h b/tools/mtmd/clip.h
+index f8fd41ef5..dcf9660e1 100644
+--- a/tools/mtmd/clip.h
++++ b/tools/mtmd/clip.h
+@@ -61,6 +61,7 @@ struct clip_context_params {
+     mtmd_progress_callback progress_callback;
+     void * progress_callback_user_data;
+     int n_threads;
++    bool use_extra_bufts; // CPU backend only: place repackable weights in extra buffer types
+ };
+ 
+ struct clip_init_result {
+diff --git a/tools/mtmd/mtmd-cli.cpp b/tools/mtmd/mtmd-cli.cpp
+index ba156f1c5..7e804f6ed 100644
+--- a/tools/mtmd/mtmd-cli.cpp
++++ b/tools/mtmd/mtmd-cli.cpp
+@@ -159,6 +159,7 @@ struct mtmd_cli_context {
+         mparams.device           = params.mmproj_device;
+         mparams.print_timings    = true;
+         mparams.n_threads        = params.cpuparams.n_threads;
++        mparams.use_extra_bufts  = !params.no_extra_bufts;
+         mparams.flash_attn_type  = params.flash_attn_type;
+         mparams.warmup           = params.warmup;
+         mparams.image_min_tokens = params.image_min_tokens;
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 538f90013..7eebadc93 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -580,6 +580,7 @@ mtmd_context_params mtmd_context_params_default() {
+         /* batch_max_tokens  */ 1024,
+         /* progress_callback */ nullptr,
+         /* progress_callback_user_data */ nullptr,
++        /* use_extra_bufts   */ false,
+     };
+     return params;
+ }
+@@ -696,6 +697,7 @@ struct mtmd_context {
+             /* progress_callback */ ctx_params.progress_callback,
+             /* progress_callback_user_data */ ctx_params.progress_callback_user_data,
+             /* n_threads                   */ ctx_params.n_threads,
++            /* use_extra_bufts             */ ctx_params.use_extra_bufts,
+         };
+ 
+         auto res = clip_init(mmproj_fname, ctx_clip_params);
+diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
+index 27763563c..ba402bad5 100644
+--- a/tools/mtmd/mtmd.h
++++ b/tools/mtmd/mtmd.h
+@@ -133,6 +133,10 @@ struct mtmd_context_params {
+     // If it returns false, model loading is immediately aborted.
+     mtmd_progress_callback progress_callback;
+     void * progress_callback_user_data;
++
++    // allow the CPU encoder weights to use extra buffer types (e.g. runtime repacking of quantized weights),
++    // the same mechanism the language model uses (default: false; llama-mtmd-cli and llama-server follow --repack/--no-repack)
++    bool use_extra_bufts;
+ };
+ 
+ MTMD_API const char * mtmd_default_marker(void);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 78c8ef149..118d2ef12 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1249,6 +1249,7 @@ private:
+             mparams.device           = params_base.mmproj_device;
+             mparams.print_timings    = false;
+             mparams.n_threads        = params_base.cpuparams.n_threads;
++            mparams.use_extra_bufts  = !params_base.no_extra_bufts;
+             mparams.flash_attn_type  = params_base.flash_attn_type;
+             mparams.warmup           = params_base.warmup;
+             mparams.image_min_tokens = params_base.image_min_tokens;
+-- 
+2.39.5 (Apple Git-154)
+
